@@ -1,0 +1,218 @@
+# ============================================================
+# CELL 1: Configuration & Spark Tuning
+# ============================================================
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import re
+import time
+
+storage_account = 'airdata1'
+container = 'airdata'
+raw_base = f'abfss://{container}@{storage_account}.dfs.core.windows.net/raw/'
+curated_base = f'abfss://{container}@{storage_account}.dfs.core.windows.net/curated/'
+watermark_file = f'abfss://{container}@{storage_account}.dfs.core.windows.net/control/last_processed_folder.txt'
+
+# ============================================================
+# CELL 2: Explicit CSV schema (fast read) – time columns as IntegerType
+# ============================================================
+csv_schema = StructType([
+    StructField("FL_DATE", StringType(), True),
+    StructField("MKT_UNIQUE_CARRIER", StringType(), True),
+    StructField("BRANDED_CODE_SHARE", StringType(), True),
+    StructField("MKT_CARRIER_AIRLINE_ID", IntegerType(), True),
+    StructField("MKT_CARRIER", StringType(), True),
+    StructField("MKT_CARRIER_FL_NUM", IntegerType(), True),
+    StructField("SCH_OP_UNIQUE_CARRIER", StringType(), True),
+    StructField("SCH_OP_CARRIER_AIRLINE_ID", IntegerType(), True),
+    StructField("SCH_OP_CARRIER", StringType(), True),
+    StructField("OP_UNIQUE_CARRIER", StringType(), True),
+    StructField("OP_CARRIER_AIRLINE_ID", IntegerType(), True),
+    StructField("OP_CARRIER", StringType(), True),
+    StructField("ORIGIN_AIRPORT_ID", IntegerType(), True),
+    StructField("ORIGIN_AIRPORT_SEQ_ID", IntegerType(), True),
+    StructField("ORIGIN_CITY_MARKET_ID", IntegerType(), True),
+    StructField("ORIGIN", StringType(), True),
+    StructField("ORIGIN_STATE_ABR", StringType(), True),
+    StructField("ORIGIN_STATE_FIPS", IntegerType(), True),
+    StructField("ORIGIN_WAC", IntegerType(), True),
+    StructField("DEST_AIRPORT_ID", IntegerType(), True),
+    StructField("DEST_AIRPORT_SEQ_ID", IntegerType(), True),
+    StructField("DEST_CITY_MARKET_ID", IntegerType(), True),
+    StructField("DEST", StringType(), True),
+    StructField("DEST_STATE_ABR", StringType(), True),
+    StructField("DEST_STATE_FIPS", IntegerType(), True),
+    StructField("DEST_WAC", IntegerType(), True),
+    StructField("CRS_DEP_TIME", IntegerType(), True),
+    StructField("DEP_TIME", IntegerType(), True),
+    StructField("DEP_DELAY", DoubleType(), True),
+    StructField("DEP_DEL15", DoubleType(), True),
+    StructField("DEP_DELAY_GROUP", IntegerType(), True),
+    StructField("DEP_TIME_BLK", StringType(), True),
+    StructField("CRS_ARR_TIME", IntegerType(), True),
+    StructField("ARR_TIME", IntegerType(), True),
+    StructField("ARR_DELAY", DoubleType(), True),
+    StructField("ARR_DEL15", DoubleType(), True),
+    StructField("ARR_DELAY_GROUP", IntegerType(), True),
+    StructField("ARR_TIME_BLK", StringType(), True),
+    StructField("CANCELLED", IntegerType(), True),
+    StructField("CANCELLATION_CODE", StringType(), True),
+    StructField("DIVERTED", IntegerType(), True),
+    StructField("DUP", StringType(), True),
+    StructField("CARRIER_DELAY", DoubleType(), True),
+    StructField("WEATHER_DELAY", DoubleType(), True),
+    StructField("NAS_DELAY", DoubleType(), True),
+    StructField("SECURITY_DELAY", DoubleType(), True),
+    StructField("LATE_AIRCRAFT_DELAY", DoubleType(), True),
+    StructField("DIV_AIRPORT_LANDINGS", IntegerType(), True),
+    StructField("DIV_REACHED_DEST", DoubleType(), True),
+    StructField("DIV1_AIRPORT_ID", IntegerType(), True),
+    StructField("DIV1_AIRPORT_SEQ_ID", IntegerType(), True),
+    StructField("DIV2_AIRPORT_ID", IntegerType(), True),
+    StructField("DIV2_AIRPORT_SEQ_ID", IntegerType(), True),
+])
+
+# ============================================================
+# Process a single month (time columns remain numeric)
+# ============================================================
+def process_month(folder):
+    print(f"Processing {folder}...")
+    folder_path = raw_base + folder + '/'
+    
+    # Quick CSV check
+    try:
+        files = mssparkutils.fs.ls(folder_path)
+        if not any(f.name.endswith('.csv') for f in files):
+            print(f"  No CSV files – skipping")
+            return 0
+    except Exception as e:
+        print(f"  Error listing folder: {e} – skipping")
+        return 0
+    
+    # Read CSV with explicit schema (fast)
+    df = spark.read.schema(csv_schema).option("header", True).csv(folder_path)
+    
+    # Clean FL_DATE
+    df = df.withColumn("FL_DATE_clean",
+                       when(col("FL_DATE").contains(" "), split(col("FL_DATE"), " ").getItem(0))
+                       .otherwise(col("FL_DATE")))
+    df = df.withColumn("FL_DATE_date",
+                       coalesce(to_date(col("FL_DATE_clean"), "M/d/yyyy"),
+                                to_date(col("FL_DATE_clean"), "yyyy-MM-dd"),
+                                to_date(col("FL_DATE_clean"), "MM/dd/yyyy")))
+    df = df.withColumn("FL_DATE", date_format("FL_DATE_date", "yyyy-MM-dd"))
+    df = df.filter(col("FL_DATE").isNotNull())
+    if df.count() == 0:
+        raise ValueError(f"No valid dates in {folder}")
+    
+    # Deduplicate
+    key_cols = ["FL_DATE", "MKT_CARRIER_FL_NUM", "ORIGIN_AIRPORT_ID", "DEST_AIRPORT_ID"]
+    df = df.dropDuplicates(key_cols)
+    df = df.na.drop(subset=["FL_DATE", "ORIGIN_AIRPORT_ID", "DEST_AIRPORT_ID", "MKT_CARRIER"])
+    df = df.filter(col("ORIGIN_AIRPORT_ID") != col("DEST_AIRPORT_ID"))
+    
+    # Replace "undefined" with NULL for string columns
+    for col_name in df.columns:
+        if isinstance(df.schema[col_name].dataType, StringType):
+            df = df.withColumn(col_name, when(col(col_name) == "undefined", lit(None)).otherwise(col(col_name)))
+    
+    # Fill numeric NULLs with 0 (including time columns)
+    numeric_cols = ["DEP_DELAY", "ARR_DELAY", "DEP_DEL15", "ARR_DEL15", 
+                    "CANCELLED", "DIVERTED", 
+                    "CRS_DEP_TIME", "DEP_TIME", "CRS_ARR_TIME", "ARR_TIME"]
+    for col_name in numeric_cols:
+        if col_name in df.columns:
+            # Ensure column is numeric (cast if needed)
+            if isinstance(df.schema[col_name].dataType, StringType):
+                df = df.withColumn(col_name, col(col_name).cast("int"))
+            df = df.withColumn(col_name, when(col(col_name).isNull(), 0).otherwise(col(col_name)))
+    
+    # Derive CANCELLED from cancellation code
+    if "CANCELLATION_CODE" in df.columns:
+        df = df.withColumn("CANCELLED", when(col("CANCELLATION_CODE").isNotNull(), 1).otherwise(0))
+    
+    # Fill other string attributes
+    other_attrs = ["SCH_OP_UNIQUE_CARRIER", "SCH_OP_CARRIER"]
+    for col_name in other_attrs:
+        if col_name in df.columns:
+            df = df.withColumn(col_name, when(col(col_name).isNull(), lit("Unknown")).otherwise(col(col_name)))
+    
+    # Derived columns
+    df = df.withColumn("year", year("FL_DATE_date"))
+    df = df.withColumn("month", month("FL_DATE_date"))
+    df = df.withColumn("day_of_week", dayofweek("FL_DATE_date"))
+    df = df.withColumn("is_weekend", when(col("day_of_week").isin([1,7]), 1).otherwise(0))
+    
+    if "ARR_DELAY" in df.columns:
+        df = df.withColumn("is_on_time", when((col("ARR_DELAY") <= 15) & (col("CANCELLED") == 0), 1).otherwise(0))
+        df = df.withColumn("delay_category",
+            when(col("ARR_DELAY") <= 0, "On Time")
+            .when(col("ARR_DELAY") <= 15, "Minor Delay")
+            .when(col("ARR_DELAY") <= 30, "Moderate Delay")
+            .otherwise("Major Delay"))
+    else:
+        df = df.withColumn("is_on_time", lit(0))
+        df = df.withColumn("delay_category", lit("Unknown"))
+    
+    # Drop problematic columns (time block and DIV columns)
+    problematic = ["DEP_TIME_BLK", "ARR_TIME_BLK", 
+                   "DIV3_AIRPORT_ID", "DIV3_AIRPORT_SEQ_ID",
+                   "DIV4_AIRPORT_ID", "DIV4_AIRPORT_SEQ_ID",
+                   "DIV5_AIRPORT_ID", "DIV5_AIRPORT_SEQ_ID"]
+    for col_name in problematic:
+        if col_name in df.columns:
+            df = df.drop(col_name)
+    
+    df = df.drop("FL_DATE_date", "FL_DATE_clean")
+    df = df.coalesce(4)   # reduce output files
+    
+    output_path = curated_base + folder + '/'
+    df.write.mode("overwrite").parquet(output_path)
+    print(f"  Wrote {folder} to {output_path}")
+    return 1
+
+# ============================================================
+# Main incremental logic
+# ============================================================
+try:
+    last_folder = spark.read.text(watermark_file).collect()[0][0].strip()
+    print(f"Last processed folder: '{last_folder}'")
+except:
+    last_folder = None
+    print("No watermark – processing all folders.")
+
+all_folders = [f.name.rstrip('/') for f in mssparkutils.fs.ls(raw_base) if f.isDir]
+print("Raw folders found:", all_folders)
+
+if last_folder is None:
+    new_folders = all_folders
+else:
+    new_folders = [f for f in all_folders if f != last_folder]
+
+if not new_folders:
+    print("No new folders. Exiting.")
+    mssparkutils.notebook.exit("No new data")
+else:
+    print("New folders to process:", new_folders)
+
+for folder in new_folders:
+    print(f"\n--- Starting {folder} ---")
+    start_time = time.time()
+    try:
+        result = process_month(folder)
+        if result > 0:
+            with open('/tmp/last_folder.txt', 'w') as f:
+                f.write(folder)
+            mssparkutils.fs.put(watermark_file, folder, True)
+            print(f"Watermark updated to '{folder}'")
+    except Exception as e:
+        print(f"ERROR processing {folder}: {str(e)}")
+        raise e
+    elapsed = time.time() - start_time
+    print(f"Completed {folder} in {elapsed:.2f} seconds")
+
+print("\nAll new data processed.")

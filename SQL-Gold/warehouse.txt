@@ -1,0 +1,582 @@
+-- ============================================================
+-- 1. DIMENSION TABLES
+-- ============================================================
+--1. Dim_Date
+
+CREATE TABLE [dbo].[dim_date]
+(
+    [DateKey] INT NOT NULL,
+    [FullDate] DATE NOT NULL,
+    [Year] INT NOT NULL,
+    [Quarter] INT NOT NULL,
+    [Month] INT NOT NULL,
+    [MonthName] VARCHAR(20) NOT NULL,
+    [DayOfMonth] INT NOT NULL,
+    [DayOfWeek] INT NOT NULL,
+    [DayName] VARCHAR(20) NOT NULL,
+    [DayOfYear] INT NOT NULL,
+    [WeekOfYear] INT NOT NULL,
+    [IsWeekend] BIT NOT NULL,
+    [IsLeapYear] BIT NOT NULL
+)
+WITH
+(
+    DISTRIBUTION = REPLICATE,
+    CLUSTERED INDEX ([DateKey])
+);
+
+CREATE TABLE Dim_Airport
+(
+    AirportID INT IDENTITY(1,1),
+    AirportSeqID INT,
+    CityMarketID INT,
+    AirportCode NVARCHAR(10),
+    City NVARCHAR(100) NULL,
+    State NVARCHAR(10),
+    StateFips INT,
+    Region NVARCHAR(50) NULL,
+    Country NVARCHAR(50) DEFAULT 'USA',
+    EffectiveDate DATE DEFAULT '2025-01-01',
+    ExpiryDate DATE
+)
+WITH (DISTRIBUTION = REPLICATE, CLUSTERED COLUMNSTORE INDEX);
+
+CREATE TABLE Dim_Airline
+(
+    AirlineKey INT IDENTITY(1,1),
+    AirlineID INT,
+    AirlineCode NVARCHAR(10),
+    AirlineName NVARCHAR(100) NULL,
+    UniqueCarrier NVARCHAR(10),
+    EffectiveDate DATE DEFAULT '2025-01-01',
+    ExpiryDate DATE NULL
+)
+WITH (DISTRIBUTION = REPLICATE, CLUSTERED COLUMNSTORE INDEX);
+
+CREATE TABLE Dim_FlightInfo
+(
+    FlightInfoKey INT IDENTITY(1,1),
+    FlightNum INT,
+    FlightDate DATE
+)
+WITH (DISTRIBUTION = REPLICATE, CLUSTERED COLUMNSTORE INDEX);
+
+-- ============================================================
+-- 2. FACT TABLE
+-- ============================================================
+CREATE TABLE dbo.Fact_Flights
+(
+    FlightKey BIGINT IDENTITY(1,1),
+    DateKey INT,
+    OriginAirportKey INT,
+    DestAirportKey INT,
+    AirlineKey INT,
+    FlightInfoKey INT,
+    FlightDate DATE,
+    OP_CARRIER_AIRLINE_ID INT,
+    OP_CARRIER_FL_NUM INT,
+    ORIGIN_AIRPORT_ID INT,
+    DEST_AIRPORT_ID INT,
+    CRSDepTime INT,
+    CRSArrTime INT,
+    DepTime INT,
+    ArrTime INT,
+    DepDelay DECIMAL(10,2),
+    ArrDelay DECIMAL(10,2),
+    DepDelay15Min BIT,
+    ArrDelay15Min BIT,
+    IsOnTime BIT,
+    DelayCategory NVARCHAR(30),
+    Cancelled BIT DEFAULT 0,
+    Diverted BIT DEFAULT 0,
+    CancellationCode NVARCHAR(10),
+    Month INT,
+    DayOfWeek INT,
+    IsWeekend BIT,
+    LoadDate DATETIME2,
+    SourceSystem NVARCHAR(50) DEFAULT 'Silver_Layer'
+)
+WITH (DISTRIBUTION = HASH(DateKey), CLUSTERED COLUMNSTORE INDEX);
+
+-- ============================================================
+-- 3. INITIAL DIM_DATE LOAD (2025)
+-- ============================================================
+DECLARE @StartDate DATE = '2025-01-01';
+DECLARE @EndDate DATE = '2025-12-31';
+ 
+INSERT INTO [dim_date]
+SELECT 
+    CAST(CONVERT(VARCHAR(8), CurrentDate, 112) AS INT) AS [DateKey],
+    CurrentDate AS [FullDate],
+    DATEPART(YEAR, CurrentDate) AS [Year],
+    DATEPART(QUARTER, CurrentDate) AS [Quarter],
+    DATEPART(MONTH, CurrentDate) AS [Month],
+    DATENAME(MONTH, CurrentDate) AS [MonthName],
+    DATEPART(DAY, CurrentDate) AS [DayOfMonth],
+    DATEPART(WEEKDAY, CurrentDate) AS [DayOfWeek],
+    DATENAME(WEEKDAY, CurrentDate) AS [DayName],
+    DATEPART(DAYOFYEAR, CurrentDate) AS [DayOfYear],
+    DATEPART(ISO_WEEK, CurrentDate) AS [WeekOfYear],
+    -- Uses DATENAME to avoid issues with different @@DATEFIRST regional settings
+    CASE WHEN DATENAME(WEEKDAY, CurrentDate) IN ('Saturday', 'Sunday') THEN 1 ELSE 0 END AS [IsWeekend],
+    -- Leap year calculation logic
+    CASE WHEN (DATEPART(YEAR, CurrentDate) % 4 = 0 AND DATEPART(YEAR, CurrentDate) % 100 != 0) 
+           OR (DATEPART(YEAR, CurrentDate) % 400 = 0) THEN 1 ELSE 0 END AS [IsLeapYear]
+FROM 
+(
+    -- Generate dates using ROW_NUMBER against system catalogs (a fast way to generate sequential numbers)
+    SELECT TOP (DATEDIFF(DAY, @StartDate, @EndDate) + 1)
+        DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @StartDate) AS CurrentDate
+    FROM sys.all_objects a
+    CROSS JOIN sys.all_objects b
+) AS DateSequence;
+
+-- Verify the load (include DayOfWeekName in the check)
+SELECT Count(*) FROM dim_date 
+
+
+-- ============================================================
+-- 4. EXTERNAL DATA SOURCE & FILE FORMAT
+-- ============================================================
+CREATE EXTERNAL DATA SOURCE ds_silver_Jan
+WITH (LOCATION = 'https://airdata1.dfs.core.windows.net/airdata/');
+
+CREATE EXTERNAL FILE FORMAT fmt_parquet
+WITH (FORMAT_TYPE = PARQUET);
+
+-- ============================================================
+-- 5. EXTERNAL TABLE (time columns as INT to match notebook)
+-- ============================================================
+CREATE EXTERNAL TABLE dbo.Ext_Silver_airdata (
+    FL_DATE                     NVARCHAR(10),
+    MKT_UNIQUE_CARRIER          NVARCHAR(10),
+    BRANDED_CODE_SHARE          NVARCHAR(10),
+    MKT_CARRIER_AIRLINE_ID      INT,
+    MKT_CARRIER                 NVARCHAR(10),
+    MKT_CARRIER_FL_NUM          INT,
+    SCH_OP_UNIQUE_CARRIER       NVARCHAR(50),
+    SCH_OP_CARRIER_AIRLINE_ID   INT,
+    SCH_OP_CARRIER              NVARCHAR(50),
+    OP_UNIQUE_CARRIER           NVARCHAR(10),
+    OP_CARRIER_AIRLINE_ID       INT,
+    OP_CARRIER                  NVARCHAR(10),
+    ORIGIN_AIRPORT_ID           INT,
+    ORIGIN_AIRPORT_SEQ_ID       INT,
+    ORIGIN_CITY_MARKET_ID       INT,
+    ORIGIN                      NVARCHAR(10),
+    ORIGIN_STATE_ABR            NVARCHAR(2),
+    ORIGIN_STATE_FIPS           INT,
+    ORIGIN_WAC                  INT,
+    DEST_AIRPORT_ID             INT,
+    DEST_AIRPORT_SEQ_ID         INT,
+    DEST_CITY_MARKET_ID         INT,
+    DEST                        NVARCHAR(10),
+    DEST_STATE_ABR              NVARCHAR(2),
+    DEST_STATE_FIPS             INT,
+    DEST_WAC                    INT,
+    CRS_DEP_TIME                INT,        -- ✅ changed to INT
+    DEP_TIME                    INT,        -- ✅ changed to INT
+    DEP_DELAY                   FLOAT,
+    DEP_DELAY_NEW               FLOAT,
+    DEP_DEL15                   FLOAT,
+    DEP_DELAY_GROUP             INT,
+    CRS_ARR_TIME                INT,        -- ✅ changed to INT
+    ARR_TIME                    INT,        -- ✅ changed to INT
+    ARR_DELAY                   FLOAT,
+    ARR_DELAY_NEW               FLOAT,
+    ARR_DEL15                   FLOAT,
+    ARR_DELAY_GROUP             INT,
+    CANCELLED                   INT,
+    CANCELLATION_CODE           NVARCHAR(1),
+    DIVERTED                    FLOAT,
+    DUP                         NVARCHAR(10),
+    CARRIER_DELAY               FLOAT,
+    WEATHER_DELAY               FLOAT,
+    NAS_DELAY                   FLOAT,
+    SECURITY_DELAY              FLOAT,
+    LATE_AIRCRAFT_DELAY         FLOAT,
+    DIV_AIRPORT_LANDINGS        INT,
+    DIV_REACHED_DEST            FLOAT,
+    DIV1_AIRPORT_ID             INT,
+    DIV1_AIRPORT_SEQ_ID         INT,
+    DIV2_AIRPORT_ID             INT,
+    DIV2_AIRPORT_SEQ_ID         INT,
+    year                        INT,
+    month                       INT,
+    day_of_week                 INT,
+    is_weekend                  INT,
+    is_on_time                  INT,
+    delay_category              NVARCHAR(30)
+)
+WITH (
+    LOCATION = '/curated/',
+    DATA_SOURCE = ds_silver_Jan,
+    FILE_FORMAT = fmt_parquet,
+    REJECT_TYPE = VALUE,
+    REJECT_VALUE = 0
+);
+
+
+-- ============================================================
+-- 6. STAGING TABLE (must exist before stored procedure)
+-- ============================================================
+
+
+CREATE TABLE Stage_Flights
+(
+    FL_DATE                     NVARCHAR(10),
+    ORIGIN                      NVARCHAR(10),
+    DEST                        NVARCHAR(10),
+    OP_CARRIER_AIRLINE_ID       INT,
+    MKT_CARRIER_FL_NUM          INT,
+    ORIGIN_AIRPORT_ID           INT,
+    DEST_AIRPORT_ID             INT,
+    CRS_DEP_TIME                INT,
+    CRS_ARR_TIME                INT,
+    DEP_TIME                    INT,
+    ARR_TIME                    INT,
+    DEP_DELAY                   FLOAT,
+    ARR_DELAY                   FLOAT,
+    DEP_DEL15                   FLOAT,
+    ARR_DEL15                   FLOAT,
+    CANCELLED                   INT,
+    DIVERTED                    INT,
+    CANCELLATION_CODE           NVARCHAR(1),
+    ORIGIN_AIRPORT_SEQ_ID       INT,
+    ORIGIN_CITY_MARKET_ID       INT,
+    ORIGIN_STATE_ABR            NVARCHAR(2),
+    ORIGIN_STATE_FIPS           INT,
+    DEST_AIRPORT_SEQ_ID         INT,
+    DEST_CITY_MARKET_ID         INT,
+    DEST_STATE_ABR              NVARCHAR(2),
+    DEST_STATE_FIPS             INT,
+    OP_UNIQUE_CARRIER           NVARCHAR(10),
+    OP_CARRIER                  NVARCHAR(10)   -- ✅ added
+)
+WITH (DISTRIBUTION = ROUND_ROBIN, HEAP);
+
+-- ============================================================
+-- 7. DIMENSION LOADS (incremental)
+-- ============================================================
+INSERT INTO Dim_Airport (AirportSeqID, CityMarketID, AirportCode, City, State, StateFips, Region, Country, EffectiveDate, ExpiryDate)
+SELECT DISTINCT ORIGIN_AIRPORT_SEQ_ID, ORIGIN_CITY_MARKET_ID, ORIGIN, NULL, ORIGIN_STATE_ABR, ORIGIN_STATE_FIPS, NULL, 'USA', '2025-01-01', '2025-12-31'
+FROM dbo.Ext_Silver_airdata
+WHERE ORIGIN IS NOT NULL
+AND NOT EXISTS (SELECT 1 FROM Dim_Airport a WHERE a.AirportCode = ORIGIN)
+UNION
+SELECT DISTINCT DEST_AIRPORT_SEQ_ID, DEST_CITY_MARKET_ID, DEST, NULL, DEST_STATE_ABR, DEST_STATE_FIPS, NULL, 'USA', '2025-01-01', '2025-12-31'
+FROM dbo.Ext_Silver_airdata
+WHERE DEST IS NOT NULL
+AND NOT EXISTS (SELECT 1 FROM Dim_Airport a WHERE a.AirportCode = DEST);
+
+INSERT INTO Dim_Airline (AirlineID, AirlineCode, AirlineName, UniqueCarrier, EffectiveDate, ExpiryDate)
+SELECT DISTINCT OP_CARRIER_AIRLINE_ID, OP_CARRIER, NULL, OP_UNIQUE_CARRIER, '2025-01-01', '2025-12-31'
+FROM dbo.Ext_Silver_airdata
+WHERE OP_CARRIER_AIRLINE_ID IS NOT NULL
+AND NOT EXISTS (SELECT 1 FROM Dim_Airline al WHERE al.AirlineID = OP_CARRIER_AIRLINE_ID);
+
+INSERT INTO Dim_FlightInfo (FlightNum, FlightDate)
+SELECT DISTINCT MKT_CARRIER_FL_NUM, TRY_CONVERT(DATE, FL_DATE)
+FROM dbo.Ext_Silver_airdata
+WHERE MKT_CARRIER_FL_NUM IS NOT NULL AND FL_DATE IS NOT NULL
+AND NOT EXISTS (SELECT 1 FROM Dim_FlightInfo fi WHERE fi.FlightNum = MKT_CARRIER_FL_NUM AND fi.FlightDate = TRY_CONVERT(DATE, FL_DATE));
+
+
+DELETE FROM Dim_Airport
+WHERE AirportID IN (
+    SELECT AirportID
+    FROM (
+        SELECT AirportID,
+               ROW_NUMBER() OVER (PARTITION BY AirportCode ORDER BY AirportID) AS rn
+        FROM Dim_Airport
+    ) t
+    WHERE rn > 1
+);
+
+-- 2. Remove duplicate AirlineID (keep the smallest AirlineKey)
+DELETE FROM Dim_Airline
+WHERE AirlineKey IN (
+    SELECT AirlineKey
+    FROM (
+        SELECT AirlineKey,
+               ROW_NUMBER() OVER (PARTITION BY AirlineID ORDER BY AirlineKey) AS rn
+        FROM Dim_Airline
+    ) t
+    WHERE rn > 1
+);
+
+-- 3. Remove duplicate (FlightNum, FlightDate) from Dim_FlightInfo
+DELETE FROM Dim_FlightInfo
+WHERE FlightInfoKey IN (
+    SELECT FlightInfoKey
+    FROM (
+        SELECT FlightInfoKey,
+               ROW_NUMBER() OVER (PARTITION BY FlightNum, FlightDate ORDER BY FlightInfoKey) AS rn
+        FROM Dim_FlightInfo
+    ) t
+    WHERE rn > 1
+);
+
+-- ============================================================
+-- 8. ADD UNIQUE CONSTRAINTS (NOT ENFORCED)
+-- ============================================================
+ALTER TABLE Dim_Airport ADD CONSTRAINT UQ_AirportCode UNIQUE (AirportCode) NOT ENFORCED;
+ALTER TABLE Dim_Airline ADD CONSTRAINT UQ_AirlineID UNIQUE (AirlineID) NOT ENFORCED;
+ALTER TABLE Dim_FlightInfo ADD CONSTRAINT UQ_FlightInfo UNIQUE (FlightNum, FlightDate) NOT ENFORCED;
+
+-- ============================================================
+-- 8. STORED PROCEDURE (incremental load)
+-- ============================================================
+CREATE PROCEDURE usp_IncrementalLoad
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Refresh staging table (explicit CAST to INT for time columns)
+TRUNCATE TABLE Stage_Flights;
+INSERT INTO Stage_Flights
+SELECT
+    FL_DATE,
+    ORIGIN,
+    DEST,
+    OP_CARRIER_AIRLINE_ID,
+    MKT_CARRIER_FL_NUM,
+    ORIGIN_AIRPORT_ID,
+    DEST_AIRPORT_ID,
+    CAST(CRS_DEP_TIME AS INT),
+    CAST(CRS_ARR_TIME AS INT),
+    CAST(DEP_TIME AS INT),
+    CAST(ARR_TIME AS INT),
+    DEP_DELAY,
+    ARR_DELAY,
+    DEP_DEL15,
+    ARR_DEL15,
+    CANCELLED,
+    CAST(DIVERTED AS INT),
+    CANCELLATION_CODE,
+    ORIGIN_AIRPORT_SEQ_ID,
+    ORIGIN_CITY_MARKET_ID,
+    ORIGIN_STATE_ABR,
+    ORIGIN_STATE_FIPS,
+    DEST_AIRPORT_SEQ_ID,
+    DEST_CITY_MARKET_ID,
+    DEST_STATE_ABR,
+    DEST_STATE_FIPS,
+    OP_UNIQUE_CARRIER,
+    OP_CARRIER              -- ✅ added
+FROM dbo.Ext_Silver_airdata
+WHERE FL_DATE IS NOT NULL;
+
+    -- Insert missing dates
+    INSERT INTO Dim_Date (
+        DateKey, FullDate, Year, Quarter, Month, MonthName,
+        DayOfMonth, DayOfWeek, DayName, DayOfYear, IsWeekend, WeekOfYear, IsLeapYear
+    )
+    SELECT DISTINCT
+        CONVERT(INT, REPLACE(s.FL_DATE, '-', '')),
+        TRY_CONVERT(DATE, s.FL_DATE),
+        YEAR(TRY_CONVERT(DATE, s.FL_DATE)),
+        DATEPART(QUARTER, TRY_CONVERT(DATE, s.FL_DATE)),
+        MONTH(TRY_CONVERT(DATE, s.FL_DATE)),
+        DATENAME(MONTH, TRY_CONVERT(DATE, s.FL_DATE)),
+        DAY(TRY_CONVERT(DATE, s.FL_DATE)),
+        (DATEPART(WEEKDAY, TRY_CONVERT(DATE, s.FL_DATE)) + @@DATEFIRST - 1) % 7 + 1,
+        DATENAME(WEEKDAY, TRY_CONVERT(DATE, s.FL_DATE)),
+        DATEPART(DAYOFYEAR, TRY_CONVERT(DATE, s.FL_DATE)),   -- ✅ added DayOfYear
+        CASE WHEN (DATEPART(WEEKDAY, TRY_CONVERT(DATE, s.FL_DATE)) + @@DATEFIRST - 1) % 7 + 1 IN (6,7) THEN 1 ELSE 0 END,
+        DATEPART(WEEK, TRY_CONVERT(DATE, s.FL_DATE)),
+        CASE WHEN (YEAR(TRY_CONVERT(DATE, s.FL_DATE)) % 4 = 0 AND YEAR(TRY_CONVERT(DATE, s.FL_DATE)) % 100 != 0)
+                  OR (YEAR(TRY_CONVERT(DATE, s.FL_DATE)) % 400 = 0) THEN 1 ELSE 0 END
+    FROM dbo.Stage_Flights s
+    WHERE NOT EXISTS (SELECT 1 FROM Dim_Date d WHERE d.FullDate = TRY_CONVERT(DATE, s.FL_DATE));
+
+    -- Add new origin airports
+    INSERT INTO Dim_Airport (AirportSeqID, CityMarketID, AirportCode, State, StateFips, Country, EffectiveDate, ExpiryDate)
+    SELECT DISTINCT
+        s.ORIGIN_AIRPORT_SEQ_ID, s.ORIGIN_CITY_MARKET_ID, s.ORIGIN,
+        s.ORIGIN_STATE_ABR, s.ORIGIN_STATE_FIPS,
+        'USA', '2025-01-01', '9999-12-31'
+    FROM dbo.Stage_Flights s
+    WHERE s.ORIGIN IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM Dim_Airport a WHERE a.AirportCode = s.ORIGIN);
+
+    -- Add new destination airports
+   INSERT INTO Dim_Airport (AirportSeqID, CityMarketID, AirportCode, State, StateFips, Country, EffectiveDate, ExpiryDate)
+    SELECT DISTINCT
+        s.DEST_AIRPORT_SEQ_ID, s.DEST_CITY_MARKET_ID, s.DEST,
+        s.DEST_STATE_ABR, s.DEST_STATE_FIPS,
+        'USA', '2025-01-01', '9999-12-31'
+    FROM dbo.Stage_Flights s
+    WHERE s.DEST IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM Dim_Airport a WHERE a.AirportCode = s.DEST);
+
+    -- Add new airlines
+    INSERT INTO Dim_Airline (AirlineID, AirlineCode, UniqueCarrier, EffectiveDate, ExpiryDate)
+    SELECT DISTINCT
+        s.OP_CARRIER_AIRLINE_ID, s.OP_CARRIER, s.OP_UNIQUE_CARRIER,
+        '2025-01-01', '9999-12-31'
+    FROM dbo.Stage_Flights s
+    WHERE s.OP_CARRIER_AIRLINE_ID IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM Dim_Airline al WHERE al.AirlineID = s.OP_CARRIER_AIRLINE_ID);
+
+    -- Add new flight info
+   INSERT INTO Dim_FlightInfo (FlightNum, FlightDate)
+    SELECT DISTINCT
+        s.MKT_CARRIER_FL_NUM, TRY_CONVERT(DATE, s.FL_DATE)
+    FROM Stage_Flights s
+    WHERE s.MKT_CARRIER_FL_NUM IS NOT NULL AND s.FL_DATE IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM dbo.Dim_FlightInfo fi
+                      WHERE fi.FlightNum = s.MKT_CARRIER_FL_NUM
+                        AND fi.FlightDate = TRY_CONVERT(DATE, s.FL_DATE));
+
+    -- Insert facts (only new rows) – no VARCHAR conversion for time columns
+    INSERT INTO dbo.Fact_Flights (
+        DateKey, OriginAirportKey, DestAirportKey, AirlineKey, FlightInfoKey,
+        FlightDate, OP_CARRIER_AIRLINE_ID, OP_CARRIER_FL_NUM,
+        ORIGIN_AIRPORT_ID, DEST_AIRPORT_ID,
+        CRSDepTime, CRSArrTime, DepTime, ArrTime,
+        DepDelay, ArrDelay, DepDelay15Min, ArrDelay15Min,
+        IsOnTime, DelayCategory, Cancelled, Diverted, CancellationCode,
+        Month, DayOfWeek, IsWeekend, LoadDate, SourceSystem
+    )
+    SELECT
+        dd.DateKey,
+        oa.AirportID,
+        da.AirportID,
+        al.AirlineKey,
+        fi.FlightInfoKey,
+        TRY_CONVERT(DATE, s.FL_DATE),
+        s.OP_CARRIER_AIRLINE_ID,
+        s.MKT_CARRIER_FL_NUM,
+        s.ORIGIN_AIRPORT_ID,
+        s.DEST_AIRPORT_ID,
+        s.CRS_DEP_TIME,
+        s.CRS_ARR_TIME,
+        s.DEP_TIME,
+        s.ARR_TIME,
+        CAST(s.DEP_DELAY AS DECIMAL(10,2)),
+        CAST(s.ARR_DELAY AS DECIMAL(10,2)),
+        CASE WHEN s.DEP_DEL15 = 1 THEN 1 ELSE 0 END,
+        CASE WHEN s.ARR_DEL15 = 1 THEN 1 ELSE 0 END,
+        CASE WHEN s.ARR_DELAY <= 15 AND s.CANCELLED = 0 THEN 1 ELSE 0 END,
+        CASE
+            WHEN s.ARR_DELAY <= 0 THEN 'On Time'
+            WHEN s.ARR_DELAY <= 15 THEN 'Minor Delay'
+            WHEN s.ARR_DELAY <= 30 THEN 'Moderate Delay'
+            ELSE 'Major Delay'
+        END,
+        s.CANCELLED,
+        s.DIVERTED,
+        NULLIF(s.CANCELLATION_CODE, 'undefined'),
+        MONTH(TRY_CONVERT(DATE, s.FL_DATE)),
+        (DATEPART(WEEKDAY, TRY_CONVERT(DATE, s.FL_DATE)) + @@DATEFIRST - 1) % 7 + 1,
+        CASE WHEN (DATEPART(WEEKDAY, TRY_CONVERT(DATE, s.FL_DATE)) + @@DATEFIRST - 1) % 7 + 1 IN (6,7) THEN 1 ELSE 0 END,
+        GETDATE(),
+        'Silver_Layer'
+    FROM Stage_Flights s
+    LEFT JOIN dbo.Dim_Date dd ON dd.FullDate = TRY_CONVERT(DATE, s.FL_DATE)
+    LEFT JOIN dbo.Dim_Airport oa ON oa.AirportCode = s.ORIGIN
+    LEFT JOIN dbo.Dim_Airport da ON da.AirportCode = s.DEST
+    LEFT JOIN dbo.Dim_Airline al ON al.AirlineID = s.OP_CARRIER_AIRLINE_ID
+    LEFT JOIN dbo.Dim_FlightInfo fi ON fi.FlightNum = s.MKT_CARRIER_FL_NUM
+                                     AND fi.FlightDate = TRY_CONVERT(DATE, s.FL_DATE)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dbo.Fact_Flights f
+        WHERE f.FlightDate = TRY_CONVERT(DATE, s.FL_DATE)
+          AND f.OP_CARRIER_AIRLINE_ID = s.OP_CARRIER_AIRLINE_ID
+          AND f.OP_CARRIER_FL_NUM = s.MKT_CARRIER_FL_NUM
+          AND f.ORIGIN_AIRPORT_ID = s.ORIGIN_AIRPORT_ID
+          AND f.DEST_AIRPORT_ID = s.DEST_AIRPORT_ID
+    );
+END;
+
+-- ============================================================
+-- 9. EXECUTE STORED PROCEDURE & VERIFY
+-- ============================================================
+EXEC dbo.usp_IncrementalLoad;
+
+-- Check row counts per month
+SELECT YEAR(FlightDate) AS Year, MONTH(FlightDate) AS Month, COUNT(*) AS FlightCount
+FROM dbo.Fact_Flights
+GROUP BY YEAR(FlightDate), MONTH(FlightDate)
+ORDER BY Year, Month;
+
+
+--  Check for Duplicate Flights (Natural Key)
+SELECT 
+    FlightDate, 
+    OP_CARRIER_AIRLINE_ID, 
+    OP_CARRIER_FL_NUM, 
+    ORIGIN_AIRPORT_ID, 
+    DEST_AIRPORT_ID, 
+    COUNT(*) AS DupCount
+FROM dbo.Fact_Flights
+GROUP BY FlightDate, OP_CARRIER_AIRLINE_ID, OP_CARRIER_FL_NUM, 
+         ORIGIN_AIRPORT_ID, DEST_AIRPORT_ID
+HAVING COUNT(*) > 1;
+
+-- Verify Foreign Key Integrity Expected: All counts = 0.
+
+SELECT 'Missing DateKey' AS Issue, COUNT(*) 
+FROM dbo.Fact_Flights f
+LEFT JOIN dbo.Dim_Date d ON f.DateKey = d.DateKey
+WHERE d.DateKey IS NULL
+
+UNION ALL
+
+SELECT 'Missing OriginAirportKey', COUNT(*) 
+FROM dbo.Fact_Flights f
+LEFT JOIN dbo.Dim_Airport oa ON f.OriginAirportKey = oa.AirportID
+WHERE oa.AirportID IS NULL
+
+UNION ALL
+
+SELECT 'Missing DestAirportKey', COUNT(*) 
+FROM dbo.Fact_Flights f
+LEFT JOIN dbo.Dim_Airport da ON f.DestAirportKey = da.AirportID
+WHERE da.AirportID IS NULL
+
+UNION ALL
+
+SELECT 'Missing AirlineKey', COUNT(*) 
+FROM dbo.Fact_Flights f
+LEFT JOIN dbo.Dim_Airline al ON f.AirlineKey = al.AirlineKey
+WHERE al.AirlineKey IS NULL
+
+UNION ALL
+
+SELECT 'Missing FlightInfoKey', COUNT(*) 
+FROM dbo.Fact_Flights f
+LEFT JOIN dbo.Dim_FlightInfo fi ON f.FlightInfoKey = fi.FlightInfoKey
+WHERE fi.FlightInfoKey IS NULL;
+
+-- Compare Total Row Count with External Table (Silver)
+SELECT 'External Table (Silver)' AS Source, COUNT(*) AS Rows
+FROM dbo.Ext_Silver_airdata
+UNION ALL
+SELECT 'Fact Table' AS Source, COUNT(*) AS Rows
+FROM dbo.Fact_Flights;
+
+
+
+
+-- Check duplicate AirportCode in Dim_Airport
+SELECT AirportCode, COUNT(*) AS DuplicateCount
+FROM dbo.Dim_Airport
+GROUP BY AirportCode
+HAVING COUNT(*) > 1;
+
+
+-- Check duplicate AirlineID in Dim_Airline
+SELECT AirlineID, COUNT(*) AS DuplicateCount
+FROM dbo.Dim_Airline
+GROUP BY AirlineID
+HAVING COUNT(*) > 1;
+
+-- Check duplicate (FlightNum, FlightDate) in Dim_FlightInfo
+SELECT FlightNum, FlightDate, COUNT(*) AS DuplicateCount
+FROM dbo.Dim_FlightInfo
+GROUP BY FlightNum, FlightDate
+HAVING COUNT(*) > 1;
+
+Select count (*) from dbo.fact_flights;
