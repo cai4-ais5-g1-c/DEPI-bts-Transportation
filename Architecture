@@ -1,0 +1,66 @@
+flowchart TB
+    subgraph Data Sources [📡 DATA SOURCES]
+        BTS((BTS Public Data<br/>CSV files))
+    end
+
+    subgraph Ingestion [🚀 INGESTION]
+        ADF[Azure Data Factory<br/>or Synapse Pipeline]
+    end
+
+    subgraph Storage_RAW [💾 BRONZE LAYER - Raw]
+        RAW[(Raw CSV/Parquet)]
+    end
+
+    subgraph Transformation [⚡ TRANSFORMATION]
+        DF[Synapse Mapping Data Flow]
+    end
+
+    subgraph Storage_CURATED [💎 SILVER LAYER - Curated]
+        CURATED[(Cleaned Parquet)]
+    end
+
+    subgraph Compute [🧠 COMPUTE & MODELING]
+        SQL_Pool[Dedicated SQL Pool<br/>Gold Layer]
+        subgraph Star_Schema [⭐ STAR SCHEMA]
+            DIM_DATE[dim_date]
+            DIM_AIRLINE[dim_airline]
+            DIM_AIRPORT[dim_airport]
+            FACT[fact_flights]
+        end
+    end
+
+    subgraph Serving [📊 SERVING]
+        POWERBI[Power BI Dashboard]
+    end
+
+    subgraph Orchestration_Monitoring [⏰ ORCHESTRATION & MONITORING]
+        TRIGGER[Schedule Trigger<br/>Daily 02:00 UTC]
+        MONITOR[Azure Monitor<br/>Alerts]
+    end
+
+    BTS -->|HTTP / Upload| ADF
+    ADF -->|Copy Activity| RAW
+    RAW -->|Data Flow| DF
+    DF -->|Write| CURATED
+    CURATED -->|COPY INTO| SQL_Pool
+    SQL_Pool -->|Star Schema Joins| POWERBI
+    TRIGGER -->|Starts| ADF
+    MONITOR -->|Metrics & Logs| ADF
+    MONITOR -.->|Failure Alerts| POWERBI
+
+    %% 🎨 Colorful class definitions
+    classDef source fill:#FF6B6B,stroke:#C92A2A,stroke-width:2px,color:#FFFFFF
+    classDef ingestion fill:#FF9F43,stroke:#D63031,stroke-width:2px,color:#FFFFFF
+    classDef storage fill:#FECA57,stroke:#EE5A24,stroke-width:2px,color:#2C3E50
+    classDef transform fill:#48DBFB,stroke:#0ABDE3,stroke-width:2px,color:#FFFFFF
+    classDef compute fill:#5F27CD,stroke:#341F97,stroke-width:2px,color:#FFFFFF
+    classDef serving fill:#00D2D3,stroke:#01A3A4,stroke-width:2px,color:#FFFFFF
+    classDef monitoring fill:#54A0FF,stroke:#2E86DE,stroke-width:2px,color:#FFFFFF
+
+    class BTS source
+    class ADF ingestion
+    class RAW, CURATED storage
+    class DF transform
+    class SQL_Pool, DIM_DATE, DIM_AIRLINE, DIM_AIRPORT, FACT compute
+    class POWERBI serving
+    class TRIGGER, MONITOR monitoring
